@@ -1,5 +1,5 @@
 import sqlite3
-from flask import Flask, request, jsonify, session, render_template, redirect, url_for
+from flask import Flask, request, jsonify, session, render_template
 from werkzeug.security import generate_password_hash, check_password_hash
 import os, time, threading, random
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -57,10 +57,11 @@ def index():
 
 @app.route('/get_timer', methods=['GET'])
 def get_timer():
-    c.execute("SELECT end_time FROM auction WHERE id = 1")
-    end_time = c.fetchone()[0]
-    time_remaining = max(0, end_time - int(time.time()))
-    return jsonify({"time_remaining": time_remaining})
+    c.execute("SELECT end_time, min_bid FROM auction WHERE id = 1")
+    auction_data = c.fetchone()
+    time_remaining = max(0, auction_data[0] - int(time.time()))
+    min_bid = auction_data[1]
+    return jsonify({"time_remaining": time_remaining, "min_bid": min_bid})
 
 @app.route('/register', methods=['POST'])
 def register():
