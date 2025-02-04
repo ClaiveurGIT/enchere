@@ -14,35 +14,30 @@ conn = sqlite3.connect('enchere.db', check_same_thread=False)
 c = conn.cursor()
 c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT)''')
 c.execute('''CREATE TABLE IF NOT EXISTS bids (id INTEGER PRIMARY KEY, user_id INTEGER, offer INTEGER, aes_key TEXT, hmac TEXT, timestamp INTEGER)''')
-c.execute('''CREATE TABLE IF NOT EXISTS auction (id INTEGER PRIMARY KEY, end_time INTEGER, min_bid INTEGER)''')
+c.execute('''CREATE TABLE IF NOT EXISTS auction (id INTEGER PRIMARY KEY, end_time INTEGER, min_bid INTEGER, winner TEXT, winning_bid INTEGER, status TEXT DEFAULT 'active')''')
 
 # Initialisation de l'enchère avec un timer de 5 minutes et une mise minimale aléatoire
-initial_time = int(time.time()) + 300  # 5 minutes à partir du lancement
+initial_time = int(time.time()) + 60  # 5 minutes à partir du lancement
 min_bid = random.randint(200, 500)
-c.execute("INSERT OR REPLACE INTO auction (id, end_time, min_bid) VALUES (1, ?, ?)", (initial_time, min_bid))
+c.execute("INSERT OR REPLACE INTO auction (id, end_time, min_bid, status) VALUES (1, ?, ?, 'active')", (initial_time, min_bid))
 conn.commit()
 
 # Vérification et mise à jour du timer
 def timer_check():
     while True:
-        c.execute("SELECT end_time FROM auction WHERE id = 1")
-        end_time = c.fetchone()[0]
+        c.execute("SELECT end_time, status FROM auction WHERE id = 1")
+        auction_data = c.fetchone()
 
-        if time.time() >= end_time:
+        if auction_data[1] == 'active' and time.time() >= auction_data[0]:
             c.execute("SELECT users.username, MAX(bids.offer) FROM bids JOIN users ON bids.user_id = users.id")
             winner = c.fetchone()
             if winner[0]:
-                print(f"L'utilisateur {winner[0]} a gagné avec l'offre de {winner[1]}")
-
-            # Réinitialisation de la base de données après la fin de l'enchère
-            c.execute("DELETE FROM bids")
-            c.execute("DELETE FROM auction")
+                c.execute("UPDATE auction SET winner = ?, winning_bid = ?, status = 'ended' WHERE id = 1", (winner[0], winner[1]))
+            else:
+                c.execute("UPDATE auction SET status = 'ended' WHERE id = 1")
             conn.commit()
 
-            # Redémarrer une nouvelle enchère
-            new_end_time = int(time.time()) + 300
-            new_min_bid = random.randint(200, 500)
-            c.execute("INSERT INTO auction (id, end_time, min_bid) VALUES (1, ?, ?)", (new_end_time, new_min_bid))
+            c.execute("DELETE FROM bids")
             conn.commit()
 
         time.sleep(10)
@@ -57,11 +52,22 @@ def index():
 
 @app.route('/get_timer', methods=['GET'])
 def get_timer():
-    c.execute("SELECT end_time, min_bid FROM auction WHERE id = 1")
+    c.execute("SELECT end_time, min_bid, winner, winning_bid, status FROM auction WHERE id = 1")
     auction_data = c.fetchone()
-    time_remaining = max(0, auction_data[0] - int(time.time()))
+    time_remaining = max(0, auction_data[0] - int(time.time())) if auction_data[4] == 'active' else 0
     min_bid = auction_data[1]
-    return jsonify({"time_remaining": time_remaining, "min_bid": min_bid})
+    winner = auction_data[2]
+    winning_bid = auction_data[3]
+    current_user = session.get('username')
+
+    return jsonify({
+        "time_remaining": time_remaining,
+        "min_bid": min_bid,
+        "winner": winner,
+        "winning_bid": winning_bid,
+        "status": auction_data[4],
+        "current_user": current_user
+    })
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -97,18 +103,20 @@ def submit_bid():
     if 'user_id' not in session:
         return jsonify({"status": "error", "message": "Utilisateur non connecté"})
 
+    c.execute("SELECT status FROM auction WHERE id = 1")
+    if c.fetchone()[0] == 'ended':
+        return jsonify({"status": "error", "message": "L'enchère est terminée."})
+
     data = request.json
     offer = int(data['offer'])
     aes_key = data['aes_key']
     hmac_value = data['hmac']
 
-    # Vérifier la mise minimale
     c.execute("SELECT min_bid FROM auction WHERE id = 1")
     min_bid = c.fetchone()[0]
     if offer < min_bid:
         return jsonify({"status": "error", "message": f"L'offre doit être supérieure à {min_bid}"})
 
-    # Autoriser qu'une seule enchère par utilisateur
     c.execute("SELECT * FROM bids WHERE user_id = ?", (session['user_id'],))
     if c.fetchone():
         return jsonify({"status": "error", "message": "Vous avez déjà soumis une enchère"})
