@@ -91,6 +91,25 @@
     </div>
 
     <script>
+    // Fonction utilitaire : Convertir un ArrayBuffer en base64
+    function arrayBufferToBase64(buffer) {
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        bytes.forEach(b => binary += String.fromCharCode(b));
+        return window.btoa(binary);
+    }
+
+    // Fonction de padding PKCS#7
+    function pkcs7Pad(buffer) {
+        const blockSize = 16; // taille en octets
+        const padLength = blockSize - (buffer.byteLength % blockSize) || blockSize;
+        const pad = new Uint8Array(padLength).fill(padLength);
+        const padded = new Uint8Array(buffer.byteLength + padLength);
+        padded.set(new Uint8Array(buffer), 0);
+        padded.set(pad, buffer.byteLength);
+        return padded;
+    }
+
     function displayWinner(winner, winning_bid) {
         const winnerMessage = document.getElementById('winner');
         if (winner) {
@@ -148,15 +167,57 @@
         });
     }
 
-    function submitOffer() {
-        const offer = document.getElementById('offer').value;
-        const aes_key = btoa(crypto.getRandomValues(new Uint8Array(32)).toString());
-        const hmac_value = btoa(crypto.getRandomValues(new Uint8Array(32)).toString());
+    // Fonction modifiée pour générer une clé AES-CBC et chiffrer l'offre
+    async function submitOffer() {
+        const offerValue = document.getElementById('offer').value;
+        if (!offerValue) {
+            alert('Veuillez saisir une offre');
+            return;
+        }
 
+        // Conversion de l'offre en bytes
+        const encoder = new TextEncoder();
+        const plaintextBuffer = encoder.encode(offerValue);
+
+        // Application du padding PKCS#7
+        const paddedPlaintext = pkcs7Pad(plaintextBuffer);
+
+        // Générer une clé AES brute de 256 bits (32 octets)
+        const aesKeyRaw = window.crypto.getRandomValues(new Uint8Array(32));
+
+        // Importer la clé brute en CryptoKey pour AES-CBC
+        const aesKey = await window.crypto.subtle.importKey(
+            "raw",
+            aesKeyRaw,
+            { name: "AES-CBC" },
+            false,
+            ["encrypt", "decrypt"]
+        );
+
+        // Générer un IV aléatoire de 16 octets
+        const iv = window.crypto.getRandomValues(new Uint8Array(16));
+
+        // Chiffrement de l'offre avec AES-CBC
+        const ciphertextBuffer = await window.crypto.subtle.encrypt(
+            { name: "AES-CBC", iv: iv },
+            aesKey,
+            paddedPlaintext
+        );
+
+        // Convertir en base64 pour transmission
+        const ciphertextBase64 = arrayBufferToBase64(ciphertextBuffer);
+        const ivBase64 = arrayBufferToBase64(iv.buffer);
+        const aesKeyBase64 = arrayBufferToBase64(aesKeyRaw.buffer);
+
+        // Exemple d'envoi au serveur : on envoie le ciphertext, l'IV et la clé AES brute (à adapter selon vos besoins)
         fetch('/bid', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ offer, aes_key, hmac: hmac_value })
+            body: JSON.stringify({ 
+                encrypted_offer: ciphertextBase64,
+                iv: ivBase64,
+                aes_key: aesKeyBase64,
+            })
         })
         .then(response => response.json())
         .then(data => alert(data.message));
@@ -166,42 +227,42 @@
         const offerInput = document.getElementById('offer');
         const submitButton = document.getElementById('submit-offer-btn');
 
-    const interval = setInterval(() => {
-        fetch('/get_timer')
-            .then(response => response.json())
-            .then(data => {
-                document.getElementById('min-bid').innerText = data.min_bid;
-                const timer = document.getElementById('timer');
+        const interval = setInterval(() => {
+            fetch('/get_timer')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('min-bid').innerText = data.min_bid;
+                    const timer = document.getElementById('timer');
 
-                if (data.status === 'ended' || data.time_remaining <= 0) {
-                    timer.innerHTML = "Enchère terminée";
-                    offerInput.disabled = true;
-                    submitButton.disabled = true;
-                    displayWinner(data.winner, data.winning_bid);
-                    displayResult(currentUser, data.winner);
-                    clearInterval(interval);
-                } else {
-                    const minutes = Math.floor(data.time_remaining / 60);
-                    const seconds = data.time_remaining % 60;
-                    timer.innerHTML = `${minutes}m ${seconds}s`;
-                }
+                    if (data.status === 'ended' || data.time_remaining <= 0) {
+                        timer.innerHTML = "Enchère terminée";
+                        offerInput.disabled = true;
+                        submitButton.disabled = true;
+                        displayWinner(data.winner, data.winning_bid);
+                        displayResult(currentUser, data.winner);
+                        clearInterval(interval);
+                    } else {
+                        const minutes = Math.floor(data.time_remaining / 60);
+                        const seconds = data.time_remaining % 60;
+                        timer.innerHTML = `${minutes}m ${seconds}s`;
+                    }
 
-                if (data.winner) {
-                    displayWinner(data.winner, data.winning_bid);
-                    displayResult(currentUser, data.winner);
-                }
-            });
-    }, 1000);
+                    if (data.winner) {
+                        displayWinner(data.winner, data.winning_bid);
+                        displayResult(currentUser, data.winner);
+                    }
+                });
+        }, 1000);
     }
 
     window.onload = function() {
-    fetch('/get_timer')
-        .then(response => response.json())
-        .then(data => {
-            if (data.winner) {
-                displayWinner(data.winner, data.winning_bid);
-            }
-        });
+        fetch('/get_timer')
+            .then(response => response.json())
+            .then(data => {
+                if (data.winner) {
+                    displayWinner(data.winner, data.winning_bid);
+                }
+            });
     }
     </script>
 </body>

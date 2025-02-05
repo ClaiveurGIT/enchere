@@ -1,10 +1,10 @@
 import sqlite3
 from flask import Flask, request, jsonify, session, render_template
 from werkzeug.security import generate_password_hash, check_password_hash
-import os, time, threading, random
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import hashes, hmac
+from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
+import os, time, threading, random, base64
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -13,7 +13,7 @@ app.secret_key = os.urandom(24)
 conn = sqlite3.connect('enchere.db', check_same_thread=False)
 c = conn.cursor()
 c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT)''')
-c.execute('''CREATE TABLE IF NOT EXISTS bids (id INTEGER PRIMARY KEY, user_id INTEGER, offer INTEGER, aes_key TEXT, hmac TEXT, timestamp INTEGER)''')
+c.execute('''CREATE TABLE IF NOT EXISTS bids (id INTEGER PRIMARY KEY, user_id INTEGER, offer INTEGER, aes_key TEXT, iv TEXT, timestamp INTEGER)''')
 c.execute('''CREATE TABLE IF NOT EXISTS auction (id INTEGER PRIMARY KEY, end_time INTEGER, min_bid INTEGER, winner TEXT, winning_bid INTEGER, status TEXT DEFAULT 'active')''')
 
 # Initialisation de l'enchère avec un timer de 5 minutes et une mise minimale aléatoire
@@ -22,6 +22,21 @@ min_bid = random.randint(200, 500)
 c.execute("INSERT OR REPLACE INTO auction (id, end_time, min_bid, status) VALUES (1, ?, ?, 'active')", (initial_time, min_bid))
 conn.commit()
 
+# Fonction pour déchiffrer l'offre
+def decrypt_offer(encrypted_offer_b64, iv_b64, aes_key_b64):
+    encrypted_offer = base64.b64decode(encrypted_offer_b64)
+    iv = base64.b64decode(iv_b64)
+    aes_key = base64.b64decode(aes_key_b64)
+
+    cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded_plaintext = decryptor.update(encrypted_offer) + decryptor.finalize()
+
+    unpadder = padding.PKCS7(128).unpadder()
+    plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()
+
+    return int(plaintext.decode('utf-8'))
+
 # Vérification et mise à jour du timer
 def timer_check():
     while True:
@@ -29,10 +44,23 @@ def timer_check():
         auction_data = c.fetchone()
 
         if auction_data[1] == 'active' and time.time() >= auction_data[0]:
-            c.execute("SELECT users.username, MAX(bids.offer) FROM bids JOIN users ON bids.user_id = users.id")
-            winner = c.fetchone()
-            if winner[0]:
-                c.execute("UPDATE auction SET winner = ?, winning_bid = ?, status = 'ended' WHERE id = 1", (winner[0], winner[1]))
+            c.execute("SELECT users.username, bids.offer FROM bids JOIN users ON bids.user_id = users.id")
+            bids = c.fetchall()
+
+            highest_bid = 0
+            winner = None
+
+            for bid in bids:
+                try:
+                    offer = int(bid[1])
+                    if offer > highest_bid:
+                        highest_bid = offer
+                        winner = bid[0]
+                except ValueError:
+                    continue
+
+            if winner:
+                c.execute("UPDATE auction SET winner = ?, winning_bid = ?, status = 'ended' WHERE id = 1", (winner, highest_bid))
             else:
                 c.execute("UPDATE auction SET status = 'ended' WHERE id = 1")
             conn.commit()
@@ -55,16 +83,13 @@ def get_timer():
     c.execute("SELECT end_time, min_bid, winner, winning_bid, status FROM auction WHERE id = 1")
     auction_data = c.fetchone()
     time_remaining = max(0, auction_data[0] - int(time.time())) if auction_data[4] == 'active' else 0
-    min_bid = auction_data[1]
-    winner = auction_data[2]
-    winning_bid = auction_data[3]
     current_user = session.get('username')
 
     return jsonify({
         "time_remaining": time_remaining,
-        "min_bid": min_bid,
-        "winner": winner,
-        "winning_bid": winning_bid,
+        "min_bid": auction_data[1],
+        "winner": auction_data[2],
+        "winning_bid": auction_data[3],
         "status": auction_data[4],
         "current_user": current_user
     })
@@ -108,12 +133,18 @@ def submit_bid():
         return jsonify({"status": "error", "message": "L'enchère est terminée."})
 
     data = request.json
-    offer = int(data['offer'])
+    encrypted_offer = data['encrypted_offer']
+    iv = data['iv']
     aes_key = data['aes_key']
-    hmac_value = data['hmac']
+
+    try:
+        offer = decrypt_offer(encrypted_offer, iv, aes_key)
+    except Exception as e:
+        return jsonify({"status": "error", "message": "Erreur de déchiffrement."})
 
     c.execute("SELECT min_bid FROM auction WHERE id = 1")
     min_bid = c.fetchone()[0]
+
     if offer < min_bid:
         return jsonify({"status": "error", "message": f"L'offre doit être supérieure à {min_bid}"})
 
@@ -121,8 +152,8 @@ def submit_bid():
     if c.fetchone():
         return jsonify({"status": "error", "message": "Vous avez déjà soumis une enchère"})
 
-    c.execute("INSERT INTO bids (user_id, offer, aes_key, hmac, timestamp) VALUES (?, ?, ?, ?, ?)",
-              (session['user_id'], offer, aes_key, hmac_value, int(time.time())))
+    c.execute("INSERT INTO bids (user_id, offer, aes_key, iv, timestamp) VALUES (?, ?, ?, ?, ?)",
+              (session['user_id'], offer, aes_key, iv, int(time.time())))
     conn.commit()
 
     return jsonify({"status": "success", "message": "Offre soumise avec succès"})
