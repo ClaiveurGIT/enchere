@@ -168,11 +168,15 @@ def login():
     else:
         return jsonify({"status": "error", "message": "Identifiants incorrects"})
 
+from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding
+from cryptography.hazmat.primitives import hashes
+
 @app.route('/bid', methods=['POST'])
 def submit_bid():
     if 'user_id' not in session:
         return jsonify({"status": "error", "message": "Utilisateur non connecté"})
 
+    # Vérifier si l'enchère est toujours active
     c.execute("SELECT status FROM auction WHERE id = 1")
     if c.fetchone()[0] == 'ended':
         return jsonify({"status": "error", "message": "L'enchère est terminée."})
@@ -180,28 +184,58 @@ def submit_bid():
     data = request.json
     encrypted_offer = data['encrypted_offer']
     iv = data['iv']
-    aes_key = data['aes_key']
+    encrypted_aes_key = data['aes_key']  # C'est maintenant la clé AES chiffrée avec RSA
 
     try:
-        offer = decrypt_offer(encrypted_offer, iv, aes_key)
+        # 🔑 1. Récupérer la clé privée de l'utilisateur
+        c.execute("SELECT private_key FROM users WHERE id = ?", (session['user_id'],))
+        private_key_pem = c.fetchone()
+        if not private_key_pem:
+            return jsonify({"status": "error", "message": "Clé privée introuvable."})
+
+        # 🔑 2. Importer la clé privée
+        private_key = serialization.load_pem_private_key(
+            private_key_pem[0].encode('utf-8'),
+            password=None,
+            backend=default_backend()
+        )
+
+        # 🔓 3. Déchiffrer la clé AES avec RSA-OAEP
+        aes_key = private_key.decrypt(
+            base64.b64decode(encrypted_aes_key),
+            rsa_padding.OAEP(
+                mgf=rsa_padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+
+        # 🔐 4. Déchiffrer l'offre avec AES
+        offer = decrypt_offer(encrypted_offer, iv, base64.b64encode(aes_key).decode('utf-8'))
+
     except Exception as e:
+        print(f"Erreur de déchiffrement : {e}")
         return jsonify({"status": "error", "message": "Erreur de déchiffrement."})
 
+    # Vérification de l'offre par rapport à l'enchère minimale
     c.execute("SELECT min_bid FROM auction WHERE id = 1")
     min_bid = c.fetchone()[0]
 
     if offer < min_bid:
         return jsonify({"status": "error", "message": f"L'offre doit être supérieure à {min_bid}"})
 
+    # Vérifier si l'utilisateur a déjà soumis une enchère
     c.execute("SELECT * FROM bids WHERE user_id = ?", (session['user_id'],))
     if c.fetchone():
         return jsonify({"status": "error", "message": "Vous avez déjà soumis une enchère"})
 
+    # Enregistrement de l'enchère
     c.execute("INSERT INTO bids (user_id, offer, aes_key, iv, timestamp) VALUES (?, ?, ?, ?, ?)",
-              (session['user_id'], offer, aes_key, iv, int(time.time())))
+              (session['user_id'], offer, encrypted_aes_key, iv, int(time.time())))
     conn.commit()
 
     return jsonify({"status": "success", "message": "Offre soumise avec succès"})
+
 
 if __name__ == '__main__':
     app.run(debug=True)

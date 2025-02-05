@@ -188,77 +188,82 @@
     }
 }
 
-async function importRsaPublicKey(pem) {
-    const binaryDer = atob(pem.replace(/-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|\\s+/g, ''));
-    const binaryArray = new Uint8Array([...binaryDer].map(char => char.charCodeAt(0)));
-    return window.crypto.subtle.importKey(
-        "spki",
-        binaryArray.buffer,
-        { name: "RSA-OAEP", hash: "SHA-256" },
-        true,
-        ["encrypt"]
-    );
-}
-
-async function submitOffer() {
-    const offerValue = document.getElementById('offer').value;
-    if (!offerValue) {
-        alert('Veuillez saisir une offre');
-        return;
+    async function importRsaPublicKey(pem) {
+        const binaryDer = atob(pem.replace(/-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|\\s+/g, ''));
+        const binaryArray = new Uint8Array([...binaryDer].map(char => char.charCodeAt(0)));
+        return window.crypto.subtle.importKey(
+            "spki",
+            binaryArray.buffer,
+            { name: "RSA-OAEP", hash: "SHA-256" },
+            true,
+            ["encrypt"]
+        );
     }
-    const encoder = new TextEncoder();
-    const plaintextBuffer = encoder.encode(offerValue);
-    const paddedPlaintext = pkcs7Pad(plaintextBuffer);
-    const aesKeyRaw = window.crypto.getRandomValues(new Uint8Array(32));
-    const aesKey = await window.crypto.subtle.importKey(
+
+    async function submitOffer() {
+        const offerValue = document.getElementById('offer').value;
+        if (!offerValue) {
+            alert('Veuillez saisir une offre');
+            return;
+        }
+        const encoder = new TextEncoder();
+        const plaintextBuffer = encoder.encode(offerValue);
+        const paddedPlaintext = pkcs7Pad(plaintextBuffer);
+        const aesKeyRaw = window.crypto.getRandomValues(new Uint8Array(32));
+        // Import de la clé AES brute
+        const aesKey = await window.crypto.subtle.importKey(
             "raw",
-            aesKeyRaw,
+            aesKeyRaw, // clé brute (ArrayBuffer)
             { name: "AES-CBC" },
             false,
             ["encrypt", "decrypt"]
         );
 
-    // Générer un IV aléatoire de 16 octets
-    const iv = window.crypto.getRandomValues(new Uint8Array(16));
+        // Générer un IV aléatoire de 16 octets
+        const iv = window.crypto.getRandomValues(new Uint8Array(16));
 
-    // Chiffrement de l'offre avec AES-CBC
-    const ciphertextBuffer = await window.crypto.subtle.encrypt(
-        { name: "AES-CBC", iv: iv },
-        aesKey,
-        paddedPlaintext
-    );
+        // Chiffrement de l'offre avec AES-CBC
+        const ciphertextBuffer = await window.crypto.subtle.encrypt(
+            { name: "AES-CBC", iv: iv },
+            aesKey,
+            paddedPlaintext
+        );
 
-    // Convertir en base64 pour transmission
-    const ciphertextBase64 = arrayBufferToBase64(ciphertextBuffer);
-    const ivBase64 = arrayBufferToBase64(iv.buffer);
+        // Conversion en base64 pour transmission
+        const ciphertextBase64 = arrayBufferToBase64(ciphertextBuffer);
+        const ivBase64 = arrayBufferToBase64(iv.buffer);
 
-    const publicKeyPem = await getPublicKey();
-    if (!publicKeyPem) {
-        alert('Impossible de récupérer la clé publique');
-        return;
-    }
+        // Récupération de la clé publique RSA
+        const publicKeyPem = await getPublicKey();
+        if (!publicKeyPem) {
+            alert('Impossible de récupérer la clé publique');
+            return;
+        }
 
-    const rsaPublicKey = await importRsaPublicKey(publicKeyPem);
-    const encryptedAesKey = await window.crypto.subtle.encrypt(
-        { name: "RSA-OAEP" },
-        rsaPublicKey,
-        aesKey.buffer
-    );
-    const encryptedAesKeyBase64 = btoa(String.fromCharCode(...new Uint8Array(encryptedAesKey)));
+        const rsaPublicKey = await importRsaPublicKey(publicKeyPem);
 
-    fetch('/bid', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-            aes_key: encryptedAesKeyBase64,
-            encrypted_offer: ciphertextBase64,
-            iv: ivBase64,
+        // ✅ Chiffrement de la clé AES brute (et non la CryptoKey)
+        const encryptedAesKey = await window.crypto.subtle.encrypt(
+            { name: "RSA-OAEP" },
+            rsaPublicKey,
+            aesKeyRaw // Utilisation de la clé brute ici
+        );
 
+        const encryptedAesKeyBase64 = btoa(String.fromCharCode(...new Uint8Array(encryptedAesKey)));
+
+        fetch('/bid', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                aes_key: encryptedAesKeyBase64,
+                encrypted_offer: ciphertextBase64,
+                iv: ivBase64,
+
+            })
         })
-    })
-    .then(response => response.json())
-    .then(data => alert(data.message));
-}
+        .then(response => response.json())
+        .then(data => alert(data.message));
+    }
 
 
     function startTimer(currentUser) {
