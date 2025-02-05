@@ -4,6 +4,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
 import os, time, threading, random, base64
 
 app = Flask(__name__)
@@ -12,7 +14,15 @@ app.secret_key = os.urandom(24)
 # Configuration de la base de données
 conn = sqlite3.connect('enchere.db', check_same_thread=False)
 c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT)''')
+
+# Ajout des colonnes pour stocker les clés RSA
+c.execute('''CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY, 
+    username TEXT UNIQUE, 
+    password TEXT, 
+    public_key TEXT, 
+    private_key TEXT
+)''')
 c.execute('''CREATE TABLE IF NOT EXISTS bids (id INTEGER PRIMARY KEY, user_id INTEGER, offer INTEGER, aes_key TEXT, iv TEXT, timestamp INTEGER)''')
 c.execute('''CREATE TABLE IF NOT EXISTS auction (id INTEGER PRIMARY KEY, end_time INTEGER, min_bid INTEGER, winner TEXT, winning_bid INTEGER, status TEXT DEFAULT 'active')''')
 
@@ -94,14 +104,49 @@ def get_timer():
         "current_user": current_user
     })
 
+@app.route('/get_public_key', methods=['GET'])
+def get_public_key():
+    if 'user_id' not in session:
+        return jsonify({"status": "error", "message": "Utilisateur non connecté"})
+
+    user_id = session['user_id']
+    c.execute("SELECT public_key FROM users WHERE id = ?", (user_id,))
+    public_key = c.fetchone()
+
+    if public_key:
+        return jsonify({"status": "success", "public_key": public_key[0]})
+    else:
+        return jsonify({"status": "error", "message": "Clé publique non trouvée"})
+
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json
     username = data['username']
     password = generate_password_hash(data['password'])
 
+    # Génération de la paire de clés RSA 4096 bits
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=4096,
+        backend=default_backend()
+    )
+    public_key = private_key.public_key()
+
+    # Export des clés au format PEM
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption()
+    ).decode('utf-8')
+
+    public_pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode('utf-8')
+
     try:
-        c.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, password))
+        c.execute("INSERT INTO users (username, password, public_key, private_key) VALUES (?, ?, ?, ?)",
+                  (username, password, public_pem, private_pem))
         conn.commit()
         return jsonify({"status": "success", "message": "Utilisateur inscrit avec succès"})
     except sqlite3.IntegrityError:
