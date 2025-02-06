@@ -168,101 +168,53 @@
     }
 
     // Fonction modifiée pour générer une clé AES-CBC et chiffrer l'offre
-    async function getPublicKey() {
-    try {
-        const response = await fetch('/get_public_key', {
-            method: 'GET',
-            headers: { 'Content-Type': 'application/json' }
-        });
-        const data = await response.json();
-        if (data.status === 'success') {
-            console.log("Clé publique récupérée:", data.public_key);
-            return data.public_key;
-        } else {
-            console.error("Erreur:", data.message);
-            return null;
-        }
-    } catch (error) {
-        console.error("Erreur lors de la récupération de la clé publique:", error);
-        return null;
+    async function submitOffer() {
+    const offerValue = document.getElementById('offer').value;
+    if (!offerValue) {
+        alert('Veuillez saisir une offre');
+        return;
     }
+
+    const encoder = new TextEncoder();
+    const plaintextBuffer = encoder.encode(offerValue);
+    const paddedPlaintext = pkcs7Pad(plaintextBuffer);
+    const aesKeyRaw = window.crypto.getRandomValues(new Uint8Array(32));
+    const aesKey = await window.crypto.subtle.importKey("raw", aesKeyRaw, { name: "AES-CBC" }, false, ["encrypt", "decrypt"]);
+    const iv = window.crypto.getRandomValues(new Uint8Array(16));
+
+    const ciphertextBuffer = await window.crypto.subtle.encrypt({ name: "AES-CBC", iv: iv }, aesKey, paddedPlaintext);
+
+    const ciphertextBase64 = arrayBufferToBase64(ciphertextBuffer);
+    const ivBase64 = arrayBufferToBase64(iv.buffer);
+    const aesKeyBase64 = arrayBufferToBase64(aesKeyRaw.buffer);
+
+    // Génération de l'HMAC
+    const message = `${ciphertextBase64}|${ivBase64}|${aesKeyBase64}`;
+    const hmac = await generateHMAC(message);
+
+    fetch('/bid', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            encrypted_offer: ciphertextBase64,
+            iv: ivBase64,
+            aes_key: aesKeyBase64,
+            hmac: hmac
+        })
+    })
+    .then(response => response.json())
+    .then(data => alert(data.message));
 }
 
-    async function importRsaPublicKey(pem) {
-        const binaryDer = atob(pem.replace(/-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|\\s+/g, ''));
-        const binaryArray = new Uint8Array([...binaryDer].map(char => char.charCodeAt(0)));
-        return window.crypto.subtle.importKey(
-            "spki",
-            binaryArray.buffer,
-            { name: "RSA-OAEP", hash: "SHA-256" },
-            true,
-            ["encrypt"]
-        );
-    }
-
-    async function submitOffer() {
-        const offerValue = document.getElementById('offer').value;
-        if (!offerValue) {
-            alert('Veuillez saisir une offre');
-            return;
-        }
+    async function generateHMAC(message) {
         const encoder = new TextEncoder();
-        const plaintextBuffer = encoder.encode(offerValue);
-        const paddedPlaintext = pkcs7Pad(plaintextBuffer);
-        const aesKeyRaw = window.crypto.getRandomValues(new Uint8Array(32));
-        // Import de la clé AES brute
-        const aesKey = await window.crypto.subtle.importKey(
-            "raw",
-            aesKeyRaw, // clé brute (ArrayBuffer)
-            { name: "AES-CBC" },
-            false,
-            ["encrypt", "decrypt"]
-        );
+        const keyBuffer = encoder.encode("0a 79 d8 c2 db 58 fe ad 03 3b 27 09 1f 7a 58 00 74 2a 10 00 3a 25 37 06 53 99 43 35 30 ce 21 80"); // À remplacer par une vraie clé sécurisée
+        const key = await crypto.subtle.importKey("raw", keyBuffer, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
 
-        // Générer un IV aléatoire de 16 octets
-        const iv = window.crypto.getRandomValues(new Uint8Array(16));
+        const messageBuffer = encoder.encode(message);
+        const signatureBuffer = await crypto.subtle.sign("HMAC", key, messageBuffer);
 
-        // Chiffrement de l'offre avec AES-CBC
-        const ciphertextBuffer = await window.crypto.subtle.encrypt(
-            { name: "AES-CBC", iv: iv },
-            aesKey,
-            paddedPlaintext
-        );
-
-        // Conversion en base64 pour transmission
-        const ciphertextBase64 = arrayBufferToBase64(ciphertextBuffer);
-        const ivBase64 = arrayBufferToBase64(iv.buffer);
-
-        // Récupération de la clé publique RSA
-        const publicKeyPem = await getPublicKey();
-        if (!publicKeyPem) {
-            alert('Impossible de récupérer la clé publique');
-            return;
-        }
-
-        const rsaPublicKey = await importRsaPublicKey(publicKeyPem);
-
-        // ✅ Chiffrement de la clé AES brute (et non la CryptoKey)
-        const encryptedAesKey = await window.crypto.subtle.encrypt(
-            { name: "RSA-OAEP" },
-            rsaPublicKey,
-            aesKeyRaw // Utilisation de la clé brute ici
-        );
-
-        const encryptedAesKeyBase64 = btoa(String.fromCharCode(...new Uint8Array(encryptedAesKey)));
-
-        fetch('/bid', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-                aes_key: encryptedAesKeyBase64,
-                encrypted_offer: ciphertextBase64,
-                iv: ivBase64,
-
-            })
-        })
-        .then(response => response.json())
-        .then(data => alert(data.message));
+        return btoa(String.fromCharCode(...new Uint8Array(signatureBuffer)));
     }
 
 

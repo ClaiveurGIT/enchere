@@ -4,25 +4,25 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import serialization
 import os, time, threading, random, base64
+import hmac
+import hashlib
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
+HMAC_SECRET_KEY = b"0a 79 d8 c2 db 58 fe ad 03 3b 27 09 1f 7a 58 00 74 2a 10 00 3a 25 37 06 53 99 43 35 30 ce 21 80" 
+
+
+def generate_hmac(message):
+    if isinstance(message, str):
+        message = message.encode()
+    hmac_digest = hmac.new(HMAC_SECRET_KEY, message, hashlib.sha256).digest()
+    return base64.b64encode(hmac_digest).decode()
 
 # Configuration de la base de données
 conn = sqlite3.connect('enchere.db', check_same_thread=False)
 c = conn.cursor()
-
-# Ajout des colonnes pour stocker les clés RSA
-c.execute('''CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY, 
-    username TEXT UNIQUE, 
-    password TEXT, 
-    public_key TEXT, 
-    private_key TEXT
-)''')
+c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT)''')
 c.execute('''CREATE TABLE IF NOT EXISTS bids (id INTEGER PRIMARY KEY, user_id INTEGER, offer INTEGER, aes_key TEXT, iv TEXT, timestamp INTEGER)''')
 c.execute('''CREATE TABLE IF NOT EXISTS auction (id INTEGER PRIMARY KEY, end_time INTEGER, min_bid INTEGER, winner TEXT, winning_bid INTEGER, status TEXT DEFAULT 'active')''')
 
@@ -104,49 +104,14 @@ def get_timer():
         "current_user": current_user
     })
 
-@app.route('/get_public_key', methods=['GET'])
-def get_public_key():
-    if 'user_id' not in session:
-        return jsonify({"status": "error", "message": "Utilisateur non connecté"})
-
-    user_id = session['user_id']
-    c.execute("SELECT public_key FROM users WHERE id = ?", (user_id,))
-    public_key = c.fetchone()
-
-    if public_key:
-        return jsonify({"status": "success", "public_key": public_key[0]})
-    else:
-        return jsonify({"status": "error", "message": "Clé publique non trouvée"})
-
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json
     username = data['username']
     password = generate_password_hash(data['password'])
 
-    # Génération de la paire de clés RSA 4096 bits
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=4096,
-        backend=default_backend()
-    )
-    public_key = private_key.public_key()
-
-    # Export des clés au format PEM
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption()
-    ).decode('utf-8')
-
-    public_pem = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    ).decode('utf-8')
-
     try:
-        c.execute("INSERT INTO users (username, password, public_key, private_key) VALUES (?, ?, ?, ?)",
-                  (username, password, public_pem, private_pem))
+        c.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, password))
         conn.commit()
         return jsonify({"status": "success", "message": "Utilisateur inscrit avec succès"})
     except sqlite3.IntegrityError:
@@ -168,15 +133,11 @@ def login():
     else:
         return jsonify({"status": "error", "message": "Identifiants incorrects"})
 
-from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding
-from cryptography.hazmat.primitives import hashes
-
 @app.route('/bid', methods=['POST'])
 def submit_bid():
     if 'user_id' not in session:
         return jsonify({"status": "error", "message": "Utilisateur non connecté"})
 
-    # Vérifier si l'enchère est toujours active
     c.execute("SELECT status FROM auction WHERE id = 1")
     if c.fetchone()[0] == 'ended':
         return jsonify({"status": "error", "message": "L'enchère est terminée."})
@@ -184,54 +145,34 @@ def submit_bid():
     data = request.json
     encrypted_offer = data['encrypted_offer']
     iv = data['iv']
-    encrypted_aes_key = data['aes_key']  # C'est maintenant la clé AES chiffrée avec RSA
+    aes_key = data['aes_key']
+    received_hmac = data['hmac']
 
     try:
-        # 🔑 1. Récupérer la clé privée de l'utilisateur
-        c.execute("SELECT private_key FROM users WHERE id = ?", (session['user_id'],))
-        private_key_pem = c.fetchone()
-        if not private_key_pem:
-            return jsonify({"status": "error", "message": "Clé privée introuvable."})
-
-        # 🔑 2. Importer la clé privée
-        private_key = serialization.load_pem_private_key(
-            private_key_pem[0].encode('utf-8'),
-            password=None,
-            backend=default_backend()
-        )
-
-        # 🔓 3. Déchiffrer la clé AES avec RSA-OAEP
-        aes_key = private_key.decrypt(
-            base64.b64decode(encrypted_aes_key),
-            rsa_padding.OAEP(
-                mgf=rsa_padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
-
-        # 🔐 4. Déchiffrer l'offre avec AES
-        offer = decrypt_offer(encrypted_offer, iv, base64.b64encode(aes_key).decode('utf-8'))
-
-    except Exception as e:
-        print(f"Erreur de déchiffrement : {e}")
+        offer = decrypt_offer(encrypted_offer, iv, aes_key)
+    except Exception:
         return jsonify({"status": "error", "message": "Erreur de déchiffrement."})
 
-    # Vérification de l'offre par rapport à l'enchère minimale
     c.execute("SELECT min_bid FROM auction WHERE id = 1")
     min_bid = c.fetchone()[0]
 
     if offer < min_bid:
         return jsonify({"status": "error", "message": f"L'offre doit être supérieure à {min_bid}"})
 
-    # Vérifier si l'utilisateur a déjà soumis une enchère
+    # Vérification de l'HMAC
+    message = f"{encrypted_offer}|{iv}|{aes_key}"
+    expected_hmac = generate_hmac(message)
+    print(expected_hmac)
+    print(received_hmac)
+    if not hmac.compare_digest(expected_hmac, received_hmac):
+        return jsonify({"status": "error", "message": "Échec de vérification HMAC. Offre invalide."})
+
     c.execute("SELECT * FROM bids WHERE user_id = ?", (session['user_id'],))
     if c.fetchone():
         return jsonify({"status": "error", "message": "Vous avez déjà soumis une enchère"})
 
-    # Enregistrement de l'enchère
     c.execute("INSERT INTO bids (user_id, offer, aes_key, iv, timestamp) VALUES (?, ?, ?, ?, ?)",
-              (session['user_id'], offer, encrypted_aes_key, iv, int(time.time())))
+              (session['user_id'], offer, aes_key, iv, int(time.time())))
     conn.commit()
 
     return jsonify({"status": "success", "message": "Offre soumise avec succès"})
